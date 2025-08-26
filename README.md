@@ -29,6 +29,8 @@ A [Telegram bot](https://core.telegram.org/bots/api) that integrates with OpenAI
 - [x] Stream support
 - [x] GPT-4 support
   - If you have access to the GPT-4 API, simply change the `OPENAI_MODEL` parameter to `gpt-4`
+- [x] GPT-5 support
+  - If you have access to the GPT-5 API, simply change the `OPENAI_MODEL` parameter to `gpt-5`, `gpt-5-mini`, or `gpt-5-nano`
 - [x] Localized bot language
   - Available languages :brazil: :cn: :finland: :de: :indonesia: :iran: :it: :malaysia: :netherlands: :poland: :ru: :saudi_arabia: :es: :taiwan: :tr: :ukraine: :gb: :uzbekistan: :vietnam: :israel:
 - [x] Improved inline queries support for group and private chats - by [@bugfloyd](https://github.com/bugfloyd)

@@ -27,6 +27,7 @@ def main():
         exit(1)
 
     # Setup configurations
+    # Available models: gpt-3.5-turbo, gpt-4, gpt-4o, gpt-5, gpt-5-mini, gpt-5-nano, o1, o1-mini
     model = os.environ.get('OPENAI_MODEL', 'gpt-4o')
     functions_available = are_functions_available(model=model)
     max_tokens_default = default_max_tokens(model=model)
