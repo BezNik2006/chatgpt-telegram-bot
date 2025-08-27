@@ -61,12 +61,13 @@ def default_max_tokens(model: str) -> int:
 
 def are_functions_available(model: str) -> bool:
     """
-    Whether the given model supports functions
+    Whether the given model supports functions (or tools)
     """
     if model in ("gpt-3.5-turbo-0301", "gpt-4-0314", "gpt-4-32k-0314", "gpt-3.5-turbo-0613", "gpt-3.5-turbo-16k-0613"):
         return False
     if model in O_MODELS:
         return False
+    # GPT-5 поддерживает инструменты (tools)
     return True
 
 
@@ -201,7 +202,8 @@ class OpenAIHelper:
         """
         plugins_used = ()
         response = await self.__common_get_chat_response(chat_id, query, stream=True)
-        if self.config['enable_functions'] and not self.conversations_vision.get(chat_id, False):
+        is_gpt5 = self.config['model'] in GPT_5_MODELS
+        if self.config['enable_functions'] and not self.conversations_vision.get(chat_id, False) and not is_gpt5:
             response, plugins_used = await self.__handle_function_call(chat_id, response, stream=True)
             if is_direct_result(response):
                 yield response, '0'
@@ -277,7 +279,9 @@ class OpenAIHelper:
                     logging.warning(f'Error while summarising chat history: {str(e)}. Popping elements instead...')
                     self.conversations[chat_id] = self.conversations[chat_id][-self.config['max_history_size']:]
 
-            max_tokens_str = 'max_completion_tokens' if self.config['model'] in O_MODELS or self.config['model'] in GPT_5_MODELS else 'max_tokens'
+            is_gpt5 = self.config['model'] in GPT_5_MODELS
+            is_gpt5 = self.config['model'] in GPT_5_MODELS
+            max_tokens_str = 'max_completion_tokens' if self.config['model'] in O_MODELS or is_gpt5 else 'max_tokens'
             common_args = {
                 'model': self.config['model'] if not is_vision else self.config['vision_model'],
                 'messages': self.conversations[chat_id],
@@ -289,11 +293,17 @@ class OpenAIHelper:
                 'stream': stream
             }
 
-            if self.config['enable_functions'] and not is_vision:
+            # Для GPT-5 избегаем tools при stream, чтобы не ломать поток ответов
+            if self.config['enable_functions'] and not is_vision and not (is_gpt5 and stream):
                 functions = self.plugin_manager.get_functions_specs()
                 if len(functions) > 0:
-                    common_args['functions'] = self.plugin_manager.get_functions_specs()
-                    common_args['function_call'] = 'auto'
+                    if is_gpt5:
+                        tools = [{'type': 'function', 'function': f} for f in functions]
+                        common_args['tools'] = tools
+                        common_args['tool_choice'] = 'auto'
+                    else:
+                        common_args['functions'] = functions
+                        common_args['function_call'] = 'auto'
             
             # Логируем параметры запроса
             self._log_openai('DEBUG', f'Request parameters: model={common_args["model"]}, temperature={common_args["temperature"]}, {max_tokens_str}={common_args[max_tokens_str]}, stream={stream}')
@@ -327,16 +337,29 @@ class OpenAIHelper:
     async def __handle_function_call(self, chat_id, response, stream=False, times=0, plugins_used=()):
         function_name = ''
         arguments = ''
+        tool_call_id = ''
+        is_gpt5 = self.config['model'] in GPT_5_MODELS
         if stream:
             async for item in response:
                 if len(item.choices) > 0:
                     first_choice = item.choices[0]
-                    if first_choice.delta and first_choice.delta.function_call:
-                        if first_choice.delta.function_call.name:
-                            function_name += first_choice.delta.function_call.name
-                        if first_choice.delta.function_call.arguments:
-                            arguments += first_choice.delta.function_call.arguments
-                    elif first_choice.finish_reason and first_choice.finish_reason == 'function_call':
+                    if first_choice.delta:
+                        # GPT-4 style function_call
+                        if first_choice.delta.function_call:
+                            if first_choice.delta.function_call.name:
+                                function_name += first_choice.delta.function_call.name
+                            if first_choice.delta.function_call.arguments:
+                                arguments += first_choice.delta.function_call.arguments
+                        # GPT-5 style tool_calls
+                        if hasattr(first_choice.delta, 'tool_calls') and first_choice.delta.tool_calls:
+                            tc = first_choice.delta.tool_calls[0]
+                            tool_call_id = getattr(tc, 'id', tool_call_id) or tool_call_id
+                            if tc.function:
+                                if tc.function.name:
+                                    function_name += tc.function.name
+                                if tc.function.arguments:
+                                    arguments += tc.function.arguments
+                    elif first_choice.finish_reason and (first_choice.finish_reason == 'function_call' or first_choice.finish_reason == 'tool_calls'):
                         break
                     else:
                         return response, plugins_used
@@ -345,11 +368,21 @@ class OpenAIHelper:
         else:
             if len(response.choices) > 0:
                 first_choice = response.choices[0]
+                # GPT-4 style function_call
                 if first_choice.message.function_call:
                     if first_choice.message.function_call.name:
                         function_name += first_choice.message.function_call.name
                     if first_choice.message.function_call.arguments:
                         arguments += first_choice.message.function_call.arguments
+                # GPT-5 style tool_calls
+                elif hasattr(first_choice.message, 'tool_calls') and first_choice.message.tool_calls:
+                    tc = first_choice.message.tool_calls[0]
+                    tool_call_id = getattr(tc, 'id', tool_call_id)
+                    if tc.function:
+                        if tc.function.name:
+                            function_name += tc.function.name
+                        if tc.function.arguments:
+                            arguments += tc.function.arguments
                 else:
                     return response, plugins_used
             else:
@@ -367,14 +400,37 @@ class OpenAIHelper:
                                                                               'to the user.'}))
             return function_response, plugins_used
 
-        self.__add_function_call_to_history(chat_id=chat_id, function_name=function_name, content=function_response)
-        response = await self.client.chat.completions.create(
-            model=self.config['model'],
-            messages=self.conversations[chat_id],
-            functions=self.plugin_manager.get_functions_specs(),
-            function_call='auto' if times < self.config['functions_max_consecutive_calls'] else 'none',
-            stream=stream
-        )
+        # Добавляем ответ инструмента в историю
+        if is_gpt5 and tool_call_id:
+            self.conversations[chat_id].append({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": function_response
+            })
+        else:
+            self.__add_function_call_to_history(chat_id=chat_id, function_name=function_name, content=function_response)
+
+        # Повторный запрос к модели, разрешая дополнительные вызовы инструментов/функций
+        followup_args = {
+            'model': self.config['model'],
+            'messages': self.conversations[chat_id],
+            'stream': stream
+        }
+        if times < self.config['functions_max_consecutive_calls']:
+            if is_gpt5:
+                tools = [{'type': 'function', 'function': f} for f in self.plugin_manager.get_functions_specs()]
+                followup_args['tools'] = tools
+                followup_args['tool_choice'] = 'auto'
+            else:
+                followup_args['functions'] = self.plugin_manager.get_functions_specs()
+                followup_args['function_call'] = 'auto'
+        else:
+            if is_gpt5:
+                followup_args['tool_choice'] = 'none'
+            else:
+                followup_args['function_call'] = 'none'
+
+        response = await self.client.chat.completions.create(**followup_args)
         return await self.__handle_function_call(chat_id, response, stream, times + 1, plugins_used)
 
     async def generate_image(self, prompt: str) -> tuple[str, str]:

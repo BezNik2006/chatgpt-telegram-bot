@@ -3,14 +3,14 @@ import random
 from itertools import islice
 from typing import Dict
 
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 from .plugin import Plugin
 
 
 class DDGImageSearchPlugin(Plugin):
     """
-    A plugin to search images and GIFs for a given query, using DuckDuckGo
+    A plugin to search images and GIFs for a given query, using DuckDuckGo (ddgs)
     """
     def __init__(self):
         self.safesearch = os.getenv('DUCKDUCKGO_SAFESEARCH', 'moderate')
@@ -69,6 +69,6 @@ class DDGImageSearchPlugin(Plugin):
                 'direct_result': {
                     'kind': image_type,
                     'format': 'url',
-                    'value': results[0]['image']
+                    'value': results[0].get('image') or results[0].get('thumbnail') or ''
                 }
             }

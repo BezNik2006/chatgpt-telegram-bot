@@ -2,14 +2,14 @@ import os
 from itertools import islice
 from typing import Dict
 
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 from .plugin import Plugin
 
 
 class DDGWebSearchPlugin(Plugin):
     """
-    A plugin to search the web for a given query, using DuckDuckGo
+    A plugin to search the web for a given query, using DuckDuckGo (ddgs)
     """
     def __init__(self):
         self.safesearch = os.getenv('DUCKDUCKGO_SAFESEARCH', 'moderate')
@@ -60,8 +60,8 @@ class DDGWebSearchPlugin(Plugin):
 
             def to_metadata(result: Dict) -> Dict[str, str]:
                 return {
-                    "snippet": result["body"],
-                    "title": result["title"],
-                    "link": result["href"],
+                    "snippet": result.get("body", ""),
+                    "title": result.get("title", ""),
+                    "link": result.get("href", ""),
                 }
             return {"result": [to_metadata(result) for result in results]}
