@@ -113,6 +113,31 @@ class OpenAIHelper:
         self.conversations: dict[int: list] = {}  # {chat_id: history}
         self.conversations_vision: dict[int: bool] = {}  # {chat_id: is_vision}
         self.last_updated: dict[int: datetime] = {}  # {chat_id: last_update_timestamp}
+        
+        # Настройка логирования OpenAI
+        self.enable_openai_logging = config.get('enable_openai_logging', False)
+        self.openai_log_level = config.get('openai_log_level', 'INFO')
+        
+        if self.enable_openai_logging:
+            logging.info(f'[OpenAI] Logging enabled with level: {self.openai_log_level}')
+        else:
+            logging.debug('[OpenAI] Logging disabled')
+
+    def _log_openai(self, level: str, message: str):
+        """
+        Helper method to log OpenAI messages with proper level checking
+        """
+        if not self.enable_openai_logging:
+            return
+            
+        if level == 'DEBUG' and self.openai_log_level in ['DEBUG']:
+            logging.debug(f'[OpenAI] {message}')
+        elif level == 'INFO' and self.openai_log_level in ['DEBUG', 'INFO']:
+            logging.info(f'[OpenAI] {message}')
+        elif level == 'WARNING' and self.openai_log_level in ['DEBUG', 'INFO', 'WARNING']:
+            logging.warning(f'[OpenAI] {message}')
+        elif level == 'ERROR' and self.openai_log_level in ['DEBUG', 'INFO', 'WARNING', 'ERROR']:
+            logging.error(f'[OpenAI] {message}')
 
     def get_conversation_stats(self, chat_id: int) -> tuple[int, int]:
         """
@@ -133,7 +158,7 @@ class OpenAIHelper:
         """
         plugins_used = ()
         response = await self.__common_get_chat_response(chat_id, query)
-        if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
+        if self.config['enable_functions'] and not self.conversations_vision.get(chat_id, False):
             response, plugins_used = await self.__handle_function_call(chat_id, response)
             if is_direct_result(response):
                 return response, '0'
@@ -176,7 +201,7 @@ class OpenAIHelper:
         """
         plugins_used = ()
         response = await self.__common_get_chat_response(chat_id, query, stream=True)
-        if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
+        if self.config['enable_functions'] and not self.conversations_vision.get(chat_id, False):
             response, plugins_used = await self.__handle_function_call(chat_id, response, stream=True)
             if is_direct_result(response):
                 yield response, '0'
@@ -219,6 +244,14 @@ class OpenAIHelper:
         :return: The answer from the model and the number of tokens used
         """
         bot_language = self.config['bot_language']
+        
+        # Логируем начало запроса
+        # Безопасно проверяем, существует ли chat_id в conversations_vision
+        is_vision = self.conversations_vision.get(chat_id, False)
+        model = self.config['model'] if not is_vision else self.config['vision_model']
+        self._log_openai('INFO', f'Starting request to {model} for chat_id={chat_id}, stream={stream}')
+        self._log_openai('DEBUG', f'Query: {query[:100]}{"..." if len(query) > 100 else ""}')
+        
         try:
             if chat_id not in self.conversations or self.__max_age_reached(chat_id):
                 self.reset_chat_history(chat_id)
@@ -246,7 +279,7 @@ class OpenAIHelper:
 
             max_tokens_str = 'max_completion_tokens' if self.config['model'] in O_MODELS or self.config['model'] in GPT_5_MODELS else 'max_tokens'
             common_args = {
-                'model': self.config['model'] if not self.conversations_vision[chat_id] else self.config['vision_model'],
+                'model': self.config['model'] if not is_vision else self.config['vision_model'],
                 'messages': self.conversations[chat_id],
                 'temperature': self.config['temperature'],
                 'n': self.config['n_choices'],
@@ -256,20 +289,39 @@ class OpenAIHelper:
                 'stream': stream
             }
 
-            if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
+            if self.config['enable_functions'] and not is_vision:
                 functions = self.plugin_manager.get_functions_specs()
                 if len(functions) > 0:
                     common_args['functions'] = self.plugin_manager.get_functions_specs()
                     common_args['function_call'] = 'auto'
-            return await self.client.chat.completions.create(**common_args)
+            
+            # Логируем параметры запроса
+            self._log_openai('DEBUG', f'Request parameters: model={common_args["model"]}, temperature={common_args["temperature"]}, {max_tokens_str}={common_args[max_tokens_str]}, stream={stream}')
+            if 'functions' in common_args:
+                self._log_openai('DEBUG', f'Functions enabled: {len(common_args["functions"])} functions available')
+            
+            # Отправляем запрос к OpenAI
+            self._log_openai('INFO', 'Sending request to OpenAI API...')
+            response = await self.client.chat.completions.create(**common_args)
+            
+            # Логируем успешный ответ
+            if hasattr(response, 'usage') and response.usage:
+                self._log_openai('INFO', f'Response received: prompt_tokens={response.usage.prompt_tokens}, completion_tokens={response.usage.completion_tokens}, total_tokens={response.usage.total_tokens}')
+            else:
+                self._log_openai('INFO', 'Response received (stream mode)')
+            
+            return response
 
         except openai.RateLimitError as e:
+            self._log_openai('ERROR', f'Rate limit error for chat_id={chat_id}: {str(e)}')
             raise e
 
         except openai.BadRequestError as e:
+            self._log_openai('ERROR', f'Bad request error for chat_id={chat_id}: {str(e)}')
             raise Exception(f"⚠️ _{localized_text('openai_invalid', bot_language)}._ ⚠️\n{str(e)}") from e
 
         except Exception as e:
+            self._log_openai('ERROR', f'Unexpected error for chat_id={chat_id}: {str(e)}')
             raise Exception(f"⚠️ _{localized_text('error', bot_language)}._ ⚠️\n{str(e)}") from e
 
     async def __handle_function_call(self, chat_id, response, stream=False, times=0, plugins_used=()):
@@ -303,7 +355,7 @@ class OpenAIHelper:
             else:
                 return response, plugins_used
 
-        logging.info(f'Calling function {function_name} with arguments {arguments}')
+        self._log_openai('INFO', f'Calling function {function_name} with arguments {arguments}')
         function_response = await self.plugin_manager.call_function(function_name, self, arguments)
 
         if function_name not in plugins_used:
@@ -332,6 +384,10 @@ class OpenAIHelper:
         :return: The image URL and the image size
         """
         bot_language = self.config['bot_language']
+        
+        self._log_openai('INFO', f'Generating image with model {self.config["image_model"]}')
+        self._log_openai('DEBUG', f'Image prompt: {prompt[:100]}{"..." if len(prompt) > 100 else ""}')
+        
         try:
             response = await self.client.images.generate(
                 prompt=prompt,
@@ -343,12 +399,13 @@ class OpenAIHelper:
             )
 
             if len(response.data) == 0:
-                logging.error(f'No response from GPT: {str(response)}')
+                self._log_openai('ERROR', f'No response from DALL-E: {str(response)}')
                 raise Exception(
                     f"⚠️ _{localized_text('error', bot_language)}._ "
                     f"⚠️\n{localized_text('try_again', bot_language)}."
                 )
 
+            self._log_openai('INFO', f'Image generated successfully: {response.data[0].url}')
             return response.data[0].url, self.config['image_size']
         except Exception as e:
             raise Exception(f"⚠️ _{localized_text('error', bot_language)}._ ⚠️\n{str(e)}") from e
@@ -360,6 +417,10 @@ class OpenAIHelper:
         :return: The audio in bytes and the text size
         """
         bot_language = self.config['bot_language']
+        
+        self._log_openai('INFO', f'Generating speech with model {self.config["tts_model"]}, voice {self.config["tts_voice"]}')
+        self._log_openai('DEBUG', f'TTS text: {text[:100]}{"..." if len(text) > 100 else ""}')
+        
         try:
             response = await self.client.audio.speech.create(
                 model=self.config['tts_model'],
@@ -371,6 +432,7 @@ class OpenAIHelper:
             temp_file = io.BytesIO()
             temp_file.write(response.read())
             temp_file.seek(0)
+            self._log_openai('INFO', f'Speech generated successfully: {len(text)} characters')
             return temp_file, len(text)
         except Exception as e:
             raise Exception(f"⚠️ _{localized_text('error', bot_language)}._ ⚠️\n{str(e)}") from e
@@ -379,10 +441,12 @@ class OpenAIHelper:
         """
         Transcribes the audio file using the Whisper model.
         """
+        self._log_openai('INFO', f'Transcribing audio file: {filename}')
         try:
             with open(filename, "rb") as audio:
                 prompt_text = self.config['whisper_prompt']
                 result = await self.client.audio.transcriptions.create(model="whisper-1", file=audio, prompt=prompt_text)
+                self._log_openai('INFO', f'Transcription completed: {len(result.text)} characters')
                 return result.text
         except Exception as e:
             logging.exception(e)
@@ -476,6 +540,9 @@ class OpenAIHelper:
         """
         Interprets a given PNG image file using the Vision model.
         """
+        self._log_openai('INFO', f'Interpreting image for chat_id={chat_id} with model {self.config["vision_model"]}')
+        self._log_openai('DEBUG', f'Vision prompt: {prompt if prompt else self.config["vision_prompt"]}')
+        
         image = encode_image(fileobj)
         prompt = self.config['vision_prompt'] if prompt is None else prompt
 
@@ -609,6 +676,8 @@ class OpenAIHelper:
         :param conversation: The conversation history
         :return: The summary
         """
+        self._log_openai('INFO', f'Summarizing conversation with {len(conversation)} messages')
+        
         messages = [
             {"role": "assistant", "content": "Summarize this conversation in 700 characters or less"},
             {"role": "user", "content": str(conversation)}
@@ -618,7 +687,10 @@ class OpenAIHelper:
             messages=messages,
             temperature=1 if self.config['model'] in O_MODELS else 0.4
         )
-        return response.choices[0].message.content
+        
+        summary = response.choices[0].message.content
+        self._log_openai('INFO', f'Summary generated: {len(summary)} characters')
+        return summary
 
     def __max_model_tokens(self):
         base = 4096
